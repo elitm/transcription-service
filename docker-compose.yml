@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: transcriber
+      POSTGRES_PASSWORD: transcriber_password
+      POSTGRES_DB: transcription_db
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transcriber -d transcription_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/uploads
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql+psycopg://transcriber:transcriber_password@postgres:5432/transcription_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  tests:
+    profiles: ["test"]
+    build: .
+    command: python -m pytest -q
+    environment:
+      TEST_DATABASE_URL: postgresql+psycopg://transcriber:transcriber_password@postgres:5432/transcription_test
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
