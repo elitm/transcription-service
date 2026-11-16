@@ -72,7 +72,7 @@ Stop everything with `docker-compose down`; add `-v` to also delete the database
 
 | Method | Path | Response |
 |--------|------|----------|
-| `POST` | `/jobs` (multipart `file`) | `202` `{"job_id"}` · `400` unsupported type · `503` queue full |
+| `POST` | `/jobs` (multipart `file`) | `202` `{"job_id"}` · `400` missing filename / unsupported type · `413` over 500 MB · `503` queue full |
 | `GET` | `/jobs/{id}` | `200` job record · `404` |
 | `GET` | `/jobs/{id}/subscribe` | `200` `text/event-stream` · `404` |
 
@@ -144,9 +144,15 @@ could be dropped in without touching the API or the worker.
 Transcription takes seconds to minutes, so the upload handler only stores the file, creates
 the job row and enqueues the job id. A single background asyncio task, started and stopped in the
 FastAPI lifespan, pulls ids from a FIFO queue (`JobQueue`, max depth 100) and runs the pipeline:
-mark `processing` → transcribe (in a thread via `asyncio.to_thread` so blocking Whisper calls do not
-starve other async tasks) → mark `completed`/`failed` → publish the SSE event. When the queue is
+mark `processing` → transcribe → mark `completed`/`failed` → publish the SSE event. When the queue is
 full the upload returns `503` instead of accepting work it cannot schedule.
+
+Everything in the process shares one event loop, so one rule applies everywhere: no blocking
+call runs on the loop. The Whisper call, every `JobRepository` round-trip (synchronous
+SQLAlchemy session) and the upload's disk write all go through `asyncio.to_thread`, in the
+handlers as well as in the worker. A native async DB driver would be the next step if DB
+throughput ever mattered; wrapping the existing synchronous repository keeps one pattern for
+every blocking call instead of two.
 
 Why this and not Celery/RQ: one process, one container, no broker to operate, and the
 assignment's scale does not need horizontal workers. What it costs: the queue lives in memory,
@@ -177,16 +183,18 @@ change. Files are kept after transcription (no retention policy yet).
 
 ## Assumptions
 
-- Files small enough to be read into memory on upload (no streaming to disk, no size limit).
+- Uploads are read in 1 MB chunks and rejected with `413` once they exceed 500 MB
+  (`MAX_FILE_SIZE_BYTES`), so an oversized body is never fully buffered. Accepted files are held
+  in memory until written to disk; streaming straight to disk was left out for the MVP.
 - The caller keeps the `job_id`; there is no list endpoint.
 - Results are returned in the spoken language; translation is not a goal.
 - Jobs in flight when the service stops are not resumed. On shutdown the worker gets a 5 s
   grace period to finish the current transcription; after that the in-flight job and every job
   still in the queue are marked `interrupted` (the client can re-upload). The queue itself is
   in memory, so a hard kill (no shutdown signal) leaves those rows as `queued`/`processing`.
-- The worker and the API share one process, so the SSE subscriber lives in the API event loop
-  and the worker publishes to it thread-safely; a multi-process setup would need an external
-  pub/sub (e.g. PostgreSQL `LISTEN/NOTIFY` or Redis).
+- The worker and the API share one process and one event loop, so the worker publishes SSE
+  events straight into the subscriber's `asyncio.Queue`; a multi-process setup would need an
+  external pub/sub (e.g. PostgreSQL `LISTEN/NOTIFY` or Redis).
 
 ## Project layout
 

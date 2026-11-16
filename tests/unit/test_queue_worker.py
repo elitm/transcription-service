@@ -56,13 +56,13 @@ def queue_worker(job_queue, job_service, file_storage, event_broadcaster, fake_t
 @pytest.mark.unit
 class TestQueueWorkerInterrupt:
 
-    def test_interrupt_pending_jobs_marks_queued_jobs_interrupted(self, queue_worker, job_queue, job_service):
+    async def test_interrupt_pending_jobs_marks_queued_jobs_interrupted(self, queue_worker, job_queue, job_service):
         first = job_service.create_job("a.mp3", 10, "/uploads/a")
         second = job_service.create_job("b.mp3", 10, "/uploads/b")
         job_queue.enqueue(first)
         job_queue.enqueue(second)
 
-        queue_worker.interrupt_pending_jobs()
+        await queue_worker.interrupt_pending_jobs()
 
         assert job_service.get_job(first).status == "interrupted"
         assert job_service.get_job(second).status == "interrupted"
@@ -85,7 +85,7 @@ class TestQueueWorkerInterrupt:
         while not transcriber.started.is_set():
             await asyncio.sleep(0.01)
 
-        worker.interrupt_pending_jobs()
+        await worker.interrupt_pending_jobs()
 
         assert job_service.get_job(job_id).status == "interrupted"
         transcriber.release.set()

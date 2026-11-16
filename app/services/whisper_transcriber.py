@@ -23,9 +23,12 @@ class WhisperTranscriber:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        model = self._load_model()
-        segments, info = await asyncio.to_thread(model.transcribe, file_path)
-        text = " ".join(segment.text for segment in segments)
-        language = info.language
+        return await asyncio.to_thread(self._transcribe_blocking, file_path)
 
-        return TranscriptionResult(text=text, language=language)
+    def _transcribe_blocking(self, file_path: str) -> TranscriptionResult:
+        model = self._load_model()
+        # faster-whisper returns a lazy generator: decoding runs while iterating,
+        # so the iteration has to stay in the worker thread as well.
+        segments, info = model.transcribe(file_path)
+        text = " ".join(segment.text for segment in segments)
+        return TranscriptionResult(text=text, language=info.language)

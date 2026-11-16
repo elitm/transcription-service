@@ -49,6 +49,20 @@ class TestUploadEndpoint:
     def test_upload_requires_file(self, client):
         assert client.post("/jobs").status_code == 422
 
+    def test_upload_rejects_file_over_size_limit(self, test_job_service, test_file_storage, test_broadcaster):
+        app = create_app(
+            job_service=test_job_service,
+            file_storage=test_file_storage,
+            job_queue=JobQueue(max_depth=10),
+            event_broadcaster=test_broadcaster,
+            transcriber=FakeTranscriber(),
+            max_file_size_bytes=16,
+        )
+        with TestClient(app) as client:
+            response = client.post("/jobs", files={"file": ("big.mp3", b"x" * 17, "audio/mpeg")})
+
+        assert response.status_code == 413
+
     def test_upload_returns_503_when_queue_is_full(self, test_job_service, test_file_storage, test_broadcaster):
         transcriber = BlockingTranscriber()
         app = create_app(

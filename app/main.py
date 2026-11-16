@@ -22,6 +22,8 @@ from app.services.whisper_transcriber import WhisperTranscriber
 
 FINISHED_STATUSES = {"completed", "failed", "interrupted"}
 WORKER_POLL_SECONDS = 0.1
+MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ def create_app(
     *,
     sse_keepalive_seconds: float = 15.0,
     shutdown_grace_seconds: float = 5.0,
+    max_file_size_bytes: int = MAX_FILE_SIZE_BYTES,
 ) -> FastAPI:
     worker = QueueWorker(
         job_queue=job_queue,
@@ -54,7 +57,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        job_service.init_db()
+        await asyncio.to_thread(job_service.init_db)
         worker_task = asyncio.create_task(worker_loop())
         yield
         worker_task.cancel()
@@ -62,13 +65,13 @@ def create_app(
             await asyncio.wait_for(worker_task, timeout=shutdown_grace_seconds)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        worker.interrupt_pending_jobs()
+        await worker.interrupt_pending_jobs()
 
     app = FastAPI(title="Transcription Service", lifespan=lifespan)
 
-    def get_job_or_404(job_id: str) -> Job:
+    async def get_job_or_404(job_id: str) -> Job:
         try:
-            return job_service.get_job(job_id)
+            return await asyncio.to_thread(job_service.get_job, job_id)
         except ValueError:
             raise HTTPException(status_code=404, detail="Job not found")
 
@@ -82,22 +85,24 @@ def create_app(
         if job_queue.is_full():
             raise HTTPException(status_code=503, detail="Queue is full, retry later")
 
-        file_data = await file.read()
+        file_data = await read_upload_bounded(file, max_file_size_bytes)
         job_id = str(uuid.uuid4())
-        file_path = file_storage.save(job_id, file_data, file.filename)
-        job_service.create_job(file.filename, len(file_data), file_path, job_id=job_id)
+        file_path = await asyncio.to_thread(file_storage.save, job_id, file_data, file.filename)
+        await asyncio.to_thread(
+            job_service.create_job, file.filename, len(file_data), file_path, job_id=job_id
+        )
 
         try:
             job_queue.enqueue(job_id)
         except QueueFullError:
-            job_service.mark_interrupted(job_id)
+            await asyncio.to_thread(job_service.mark_interrupted, job_id)
             raise HTTPException(status_code=503, detail="Queue is full, retry later")
 
         return {"job_id": job_id}
 
     @app.get("/jobs/{job_id}")
     async def get_job(job_id: str) -> dict:
-        job = get_job_or_404(job_id)
+        job = await get_job_or_404(job_id)
         return {
             "id": job.id,
             "status": job.status,
@@ -113,11 +118,11 @@ def create_app(
 
     @app.get("/jobs/{job_id}/subscribe")
     async def subscribe_job(job_id: str) -> StreamingResponse:
-        get_job_or_404(job_id)
+        await get_job_or_404(job_id)
         return StreamingResponse(job_events(job_id), media_type="text/event-stream")
 
     async def job_events(job_id: str) -> AsyncIterator[str]:
-        job = job_service.get_job(job_id)
+        job = await asyncio.to_thread(job_service.get_job, job_id)
         if job.status in FINISHED_STATUSES:
             yield sse(final_event(job))
             return
@@ -130,7 +135,7 @@ def create_app(
                     next_event = asyncio.ensure_future(anext(events))
                 done, _ = await asyncio.wait({next_event}, timeout=sse_keepalive_seconds)
                 if not done:
-                    job = job_service.get_job(job_id)
+                    job = await asyncio.to_thread(job_service.get_job, job_id)
                     if job.status in FINISHED_STATUSES:
                         yield sse(final_event(job))
                         return
@@ -150,6 +155,17 @@ def create_app(
             await events.aclose()
 
     return app
+
+
+async def read_upload_bounded(file: UploadFile, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail=f"File exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def sse(event: dict) -> str:
